@@ -1,329 +1,491 @@
-<!DOCTYPE html>
-<html lang="fr">
+import http from "node:http";
+import { URL } from "node:url";
+
+// ============================================================================
+// 1. CONFIGURATION & TYPES
+// ============================================================================
+const CONFIG = {
+  PORT: process.env.PORT || 3000,
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY || "",
+  ELEVENLABS_API_KEY: process.env.ELEVENLABS_API_KEY || "",
+  REPLICATE_API_TOKEN: process.env.REPLICATE_API_TOKEN || "",
+  DEFAULT_VOICE_ID: "21m00Tcm4TlvDq8ikWAM", // Rachel / Multilingual
+};
+
+interface WordAlignment {
+  word: string;
+  start: number;
+  end: number;
+}
+
+interface Scene {
+  id: string;
+  sceneNumber: number;
+  voiceoverText: string;
+  visualPrompt: string;
+  cameraMovement: "zoom_in" | "zoom_out" | "pan_right" | "static";
+  imageUrl: string;
+  audioBase64: string;
+  durationInSec: number;
+  alignmentData: WordAlignment[];
+}
+
+interface Project {
+  id: string;
+  title: string;
+  rawStory: string;
+  genre: string;
+  visualStyle: string;
+  status: "PENDING" | "SCRIPTING" | "GENERATING" | "READY" | "FAILED";
+  progress: number;
+  statusMessage: string;
+  scenes: Scene[];
+}
+
+// Mémoire locale (remplace la base de données pour une exécution autonome)
+const db = new Map<string, Project>();
+const sseClients = new Map<string, http.ServerResponse[]>();
+
+function notifyClients(projectId: string, data: object) {
+  const clients = sseClients.get(projectId) || [];
+  const payload = `data: ${JSON.stringify(data)}\n\n`;
+  clients.forEach((res) => res.write(payload));
+}
+
+// ============================================================================
+// 2. PIPELINE D'ORCHESTRATION IA
+// ============================================================================
+
+// Étape A : Découpage scénaristique (OpenAI)
+async function generateStoryboard(story: string, genre: string, visualStyle: string) {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${CONFIG.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Tu es un réalisateur d'animation. Découpe l'histoire en scènes (3 à 6 scènes).
+Format JSON strict attendu:
+{
+  "title": "Titre",
+  "style_guide": "Description visuelle courte pour cohérence",
+  "scenes": [
+    {
+      "scene_number": 1,
+      "voiceover_text": "Texte court à prononcer",
+      "visual_prompt": "Prompt d'image détaillé",
+      "camera_movement": "zoom_in"
+    }
+  ]
+}
+Style: ${visualStyle}, Genre: ${genre}.`,
+        },
+        { role: "user", content: story },
+      ],
+    }),
+  });
+
+  const json = await res.json();
+  return JSON.parse(json.choices[0].message.content);
+}
+
+// Étape B : Audio TTS & Timestamps karaoké (ElevenLabs)
+async function generateAudio(text: string, voiceId: string) {
+  const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/with-timestamps`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "xi-api-key": CONFIG.ELEVENLABS_API_KEY,
+    },
+    body: JSON.stringify({
+      text,
+      model_id: "eleven_multilingual_v2",
+    }),
+  });
+
+  const data = await res.json();
+  const words: WordAlignment[] = [];
+  const starts = data.alignment.character_start_times_seconds;
+  const ends = data.alignment.character_end_times_seconds;
+  const chars = data.alignment.characters;
+
+  let word = "";
+  let wStart = 0;
+  chars.forEach((c: string, i: number) => {
+    if (word === "") wStart = starts[i];
+    if (c === " " || i === chars.length - 1) {
+      if (c !== " ") word += c;
+      if (word.trim()) words.push({ word: word.trim(), start: wStart, end: ends[i] });
+      word = "";
+    } else {
+      word += c;
+    }
+  });
+
+  const duration = words.length ? words[words.length - 1].end + 0.3 : 3.0;
+  return { audioBase64: data.audio_base64, words, duration };
+}
+
+// Étape C : Génération d'images (Replicate / Flux)
+async function generateImage(prompt: string, styleGuide: string): Promise<string> {
+  const startRes = await fetch("https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${CONFIG.REPLICATE_API_TOKEN}`,
+    },
+    body: JSON.stringify({
+      input: {
+        prompt: `${prompt}, ${styleGuide}, ultra-detailed, 8k, cinematic`,
+        aspect_ratio: "16:9",
+      },
+    }),
+  });
+
+  let prediction = await startRes.json();
+  while (prediction.status !== "succeeded" && prediction.status !== "failed") {
+    await new Promise((r) => setTimeout(r, 1000));
+    const poll = await fetch(prediction.urls.get, {
+      headers: { Authorization: `Bearer ${CONFIG.REPLICATE_API_TOKEN}` },
+    });
+    prediction = await poll.json();
+  }
+
+  return prediction.output[0];
+}
+
+// Orchestrateur en tâche de fond
+async function runPipeline(projectId: string) {
+  const project = db.get(projectId)!;
+  try {
+    project.status = "SCRIPTING";
+    project.progress = 15;
+    project.statusMessage = "Scénarisation avec GPT-4o...";
+    notifyClients(projectId, project);
+
+    const storyboard = await generateStoryboard(project.rawStory, project.genre, project.visualStyle);
+    project.title = storyboard.title;
+    project.status = "GENERATING";
+
+    const total = storyboard.scenes.length;
+    for (let i = 0; i < total; i++) {
+      const s = storyboard.scenes[i];
+      project.progress = 20 + Math.round(((i + 1) / total) * 75);
+      project.statusMessage = `Création des visuels et voix (Scène ${i + 1}/${total})...`;
+      notifyClients(projectId, project);
+
+      const [audioRes, imgUrl] = await Promise.all([
+        generateAudio(s.voiceover_text, CONFIG.DEFAULT_VOICE_ID),
+        generateImage(s.visual_prompt, storyboard.style_guide),
+      ]);
+
+      project.scenes.push({
+        id: `sc_${i + 1}`,
+        sceneNumber: s.scene_number,
+        voiceoverText: s.voiceover_text,
+        visualPrompt: s.visual_prompt,
+        cameraMovement: s.camera_movement || "zoom_in",
+        imageUrl: imgUrl,
+        audioBase64: audioRes.audioBase64,
+        durationInSec: audioRes.duration,
+        alignmentData: audioRes.words,
+      });
+    }
+
+    project.status = "READY";
+    project.progress = 100;
+    project.statusMessage = "Génération terminée !";
+    notifyClients(projectId, project);
+  } catch (err: any) {
+    project.status = "FAILED";
+    project.statusMessage = err.message || "Erreur durant la génération.";
+    notifyClients(projectId, project);
+  }
+}
+
+// ============================================================================
+// 3. FRONTEND INTÉGRÉ (HTML5 + TailwindCSS + Canvas Video Player)
+// ============================================================================
+const FRONTEND_HTML = `<!DOCTYPE html>
+<html lang="fr" class="dark">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MythosAI - Forge de Récits Génératifs</title>
-    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@300;400;500;600&family=Merriweather:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --gold-gradient: linear-gradient(135deg, #d4af37 0%, #f3e5ab 50%, #aa771c 100%);
-            --gold-border: #d4af37;
-            --side-white: #ffffff;
-            --bg-dark: #0d0f12;
-            --surface-dark: #161a22;
-            --text-main: #e6edf3;
-            --text-muted: #8b949e;
-            --accent: #e2b714;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-dark);
-            color: var(--text-main);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            border-left: 14px solid var(--side-white);
-            border-right: 14px solid var(--side-white);
-        }
-
-        /* En-tête Doré avec bordures latérales */
-        header {
-            background: var(--gold-gradient);
-            color: #121212;
-            padding: 2.5rem 2rem;
-            text-align: center;
-            border-bottom: 2px solid rgba(255, 255, 255, 0.4);
-            box-shadow: 0 10px 30px rgba(212, 175, 55, 0.25);
-        }
-
-        header h1 {
-            font-family: 'Cinzel', serif;
-            font-size: 2.8rem;
-            letter-spacing: 4px;
-            text-transform: uppercase;
-            font-weight: 700;
-            margin-bottom: 0.5rem;
-        }
-
-        header p {
-            font-size: 1.05rem;
-            font-weight: 500;
-            letter-spacing: 1px;
-            opacity: 0.9;
-        }
-
-        /* Conteneur Principal */
-        main {
-            flex: 1;
-            max-width: 900px;
-            width: 100%;
-            margin: 0 auto;
-            padding: 3rem 1.5rem;
-            display: flex;
-            flex-direction: column;
-            gap: 2.5rem;
-        }
-
-        /* Panneau de configuration */
-        .prompt-panel {
-            background: var(--surface-dark);
-            border: 1px solid #30363d;
-            border-radius: 12px;
-            padding: 2rem;
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-        }
-
-        .controls-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 1.5rem;
-        }
-
-        label {
-            display: block;
-            font-size: 0.85rem;
-            font-weight: 600;
-            color: var(--text-muted);
-            margin-bottom: 0.5rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        select, input[type="text"] {
-            width: 100%;
-            background: #090d13;
-            border: 1px solid #30363d;
-            color: var(--text-main);
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            font-size: 0.95rem;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-
-        select:focus, input[type="text"]:focus {
-            border-color: var(--accent);
-        }
-
-        .action-area {
-            display: flex;
-            justify-content: flex-end;
-            margin-top: 1rem;
-        }
-
-        button.btn-generate {
-            background: var(--gold-gradient);
-            color: #000;
-            font-weight: 600;
-            border: none;
-            padding: 0.9rem 2rem;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 1rem;
-            letter-spacing: 0.5px;
-            transition: transform 0.2s, box-shadow 0.2s;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        button.btn-generate:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4);
-        }
-
-        button.btn-generate:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        /* Affichage du Récit */
-        .story-display {
-            background: var(--surface-dark);
-            border: 1px solid #30363d;
-            border-radius: 12px;
-            padding: 2.5rem;
-            min-height: 250px;
-            position: relative;
-        }
-
-        .story-title {
-            font-family: 'Cinzel', serif;
-            font-size: 1.6rem;
-            color: var(--accent);
-            margin-bottom: 1.5rem;
-            border-bottom: 1px solid #30363d;
-            padding-bottom: 0.5rem;
-            display: none;
-        }
-
-        .story-body {
-            font-family: 'Merriweather', serif;
-            font-size: 1.1rem;
-            line-height: 1.8;
-            color: #c9d1d9;
-            white-space: pre-line;
-        }
-
-        .placeholder-text {
-            color: var(--text-muted);
-            font-style: italic;
-            text-align: center;
-            margin-top: 3rem;
-        }
-
-        /* Indicateur de chargement */
-        .pulse-loader {
-            display: none;
-            width: 12px;
-            height: 12px;
-            background: var(--accent);
-            border-radius: 50%;
-            margin: 2rem auto;
-            animation: pulse 1s infinite alternate;
-        }
-
-        @keyframes pulse {
-            0% { transform: scale(1); opacity: 0.4; }
-            100% { transform: scale(2); opacity: 1; }
-        }
-    </style>
+  <meta charset="UTF-8">
+  <title>Générateur de Vidéos IA</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { darkMode: 'class' }</script>
 </head>
-<body>
+<body class="bg-zinc-950 text-white min-h-screen font-sans flex flex-col">
+  <header class="h-14 border-b border-zinc-800 flex items-center justify-between px-6 bg-zinc-900">
+    <div class="font-bold text-lg text-indigo-400">StoryVision AI Studio</div>
+    <div id="statusBadge" class="text-xs bg-zinc-800 px-3 py-1 rounded-full text-zinc-400">Prêt</div>
+  </header>
 
-    <header>
-        <h1>Mythos AI</h1>
-        <p>Générateur Narratif Propulsé par Intelligence Artificielle</p>
-    </header>
+  <main class="flex-1 flex overflow-hidden">
+    <!-- Panneau Gauche : Formulaire de création -->
+    <div class="w-1/3 border-r border-zinc-800 p-6 flex flex-col gap-4 overflow-y-auto bg-zinc-900/50">
+      <h2 class="text-xl font-bold">1. Écrire l'Histoire</h2>
+      <div>
+        <label class="text-xs text-zinc-400 font-semibold">RÉCIT / IDÉE</label>
+        <textarea id="storyInput" rows="6" class="w-full mt-1 p-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm" placeholder="Il était une fois un automate abandonné sur une planète de cristal..."></textarea>
+      </div>
+      <div class="grid grid-cols-2 gap-4">
+        <div>
+          <label class="text-xs text-zinc-400 font-semibold">GENRE</label>
+          <select id="genreInput" class="w-full mt-1 p-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm">
+            <option>Science-Fiction</option>
+            <option>Heroic Fantasy</option>
+            <option>Conte Enfantin</option>
+            <option>Cyberpunk Noir</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-xs text-zinc-400 font-semibold">STYLE VISUEL</label>
+          <select id="styleInput" class="w-full mt-1 p-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm">
+            <option>Animation 3D Pixar Cinematic</option>
+            <option>Studio Ghibli Watercolor</option>
+            <option>Anime Manga Shonen</option>
+            <option>Hyper-Realistic Oil Painting</option>
+          </select>
+        </div>
+      </div>
+      <button id="generateBtn" onclick="createProject()" class="mt-2 bg-indigo-600 hover:bg-indigo-500 py-3 rounded-lg font-bold text-sm transition shadow-lg">
+        Lancer la Génération Vidéo
+      </button>
 
-    <main>
-        <section class="prompt-panel">
-            <div class="controls-grid">
-                <div>
-                    <label for="genre">Genre littéraire</label>
-                    <select id="genre">
-                        <option value="cyberpunk">Cyberpunk / Dystopie</option>
-                        <option value="fantasy">Dark Fantasy</option>
-                        <option value="scifi">Odyssée Spatiale</option>
-                        <option value="historical">Fresque Historique</option>
-                    </select>
-                </div>
-                <div>
-                    <label for="tone">Tonalité</label>
-                    <select id="tone">
-                        <option value="mystique">Énigmatique & Sombre</option>
-                        <option value="heroique">Épique & Triomphant</option>
-                        <option value="poetique">Mélancolique & Poétique</option>
-                    </select>
-                </div>
-            </div>
+      <div id="progressContainer" class="hidden flex flex-col gap-2 mt-4 p-4 bg-zinc-800/60 rounded-lg border border-zinc-700">
+        <div class="flex justify-between text-xs text-zinc-300">
+          <span id="progressText">Initialisation...</span>
+          <span id="progressPercent">0%</span>
+        </div>
+        <div class="w-full bg-zinc-700 h-2 rounded-full overflow-hidden">
+          <div id="progressBar" class="bg-indigo-500 h-full w-0 transition-all duration-300"></div>
+        </div>
+      </div>
+    </div>
 
-            <div>
-                <label for="seed">Élément déclencheur (Seed)</label>
-                <input type="text" id="seed" placeholder="Ex: Une montre mécanique découverte sur Mars..." />
-            </div>
+    <!-- Panneau Droit : Lecteur Vidéo & Rendu Canvas Synchronisé -->
+    <div class="flex-1 flex flex-col items-center justify-center p-6 bg-zinc-950 relative">
+      <div class="relative w-[768px] h-[432px] bg-black rounded-xl overflow-hidden border border-zinc-800 shadow-2xl flex items-center justify-center">
+        <canvas id="videoCanvas" width="1280" height="720" class="w-full h-full object-cover"></canvas>
+        <div id="subtitlesOverlay" class="absolute bottom-6 left-0 right-0 px-6 flex flex-wrap justify-center gap-2 pointer-events-none"></div>
+      </div>
 
-            <div class="action-area">
-                <button id="generateBtn" class="btn-generate">
-                    <span>Générer l'histoire</span>
-                </button>
-            </div>
-        </section>
+      <div class="flex items-center gap-4 mt-6">
+        <button id="playBtn" onclick="togglePlay()" class="bg-zinc-800 border border-zinc-700 hover:bg-zinc-700 px-6 py-2 rounded-lg font-semibold text-sm">Lecture</button>
+        <span id="timeTracker" class="text-xs text-zinc-400 font-mono">00:00 / 00:00</span>
+      </div>
+    </div>
+  </main>
 
-        <section class="story-display">
-            <div id="loader" class="pulse-loader"></div>
-            <h2 id="storyTitle" class="story-title"></h2>
-            <div id="storyContent" class="story-body">
-                <p class="placeholder-text">Configurez les paramètres ci-dessus pour éveiller le moteur narratif.</p>
-            </div>
-        </section>
-    </main>
+  <script>
+    let currentProject = null;
+    let isPlaying = false;
+    let currentSceneIdx = 0;
+    let sceneStartTime = 0;
+    let audioElem = new Audio();
+    const canvas = document.getElementById("videoCanvas");
+    const ctx = canvas.getContext("2d");
+    let loadedImages = {};
 
-    <script>
-        // Banques narratives simulées pour démonstration hackathon (remplaçable par un fetch API LLM)
-        const fragments = {
-            cyberpunk: [
-                "Sous la pluie d'acide de Neo-Kyoto, les néons clignotaient comme des artères mourantes.",
-                "L'androïde baissa les yeux vers le composant organique qu'il tenait dans sa paume métallique.",
-                "Dans les méandres du cyberespace, une conscience oubliée venait d'émettre son premier battement."
-            ],
-            fantasy: [
-                "Le vent glacial des montagnes de fer hurlait la chute imminente des rois anciens.",
-                "Les runes gravées sur la roche millénaire se mirent à pulser d'une lueur azurée.",
-                "Aucun homme n'était censé survivre au passage de la forêt d'ébène, pourtant il marchait encore."
-            ],
-            scifi: [
-                "À la périphérie d'Orion, le silence stellaire fut déchiré par un signal à fréquence inconnue.",
-                "Les instruments du vaisseau indiquaient une anomalie gravitationnelle défiant toute logique cartésienne.",
-                "Isolée à trois cents années-lumière de la Terre, la balise venait de s'allumer pour la première fois en un siècle."
-            ],
-            historical: [
-                "À l'aube du siège, les cloches de la citadelle sonnèrent avec une lourdeur funèbre.",
-                "Le parchemin scellé de pourpre contenait l'ordre qui allait redessiner les frontières de l'Empire.",
-                "Les pas lourds de la garde résonnaient contre les dalles froides de la cathédrale déserte."
-            ]
-        };
+    async function createProject() {
+      const story = document.getElementById("storyInput").value;
+      const genre = document.getElementById("genreInput").value;
+      const visualStyle = document.getElementById("styleInput").value;
+      if (!story) return alert("Veuillez saisir une histoire.");
 
-        const generateBtn = document.getElementById('generateBtn');
-        const storyTitle = document.getElementById('storyTitle');
-        const storyContent = document.getElementById('storyContent');
-        const loader = document.getElementById('loader');
-        const seedInput = document.getElementById('seed');
-        const genreSelect = document.getElementById('genre');
+      document.getElementById("progressContainer").classList.remove("hidden");
+      document.getElementById("generateBtn").disabled = true;
 
-        generateBtn.addEventListener('click', () => {
-            const genre = genreSelect.value;
-            const seed = seedInput.value.trim();
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ story, genre, visualStyle }),
+      });
+      const data = await res.json();
+      trackProgress(data.projectId);
+    }
 
-            // Gestion de l'état UI
-            generateBtn.disabled = true;
-            storyContent.innerHTML = "";
-            storyTitle.style.display = "none";
-            loader.style.display = "block";
+    function trackProgress(projectId) {
+      const sse = new EventSource("/api/sse/" + projectId);
+      sse.onmessage = (e) => {
+        const proj = JSON.parse(e.data);
+        currentProject = proj;
 
-            // Simulation du temps de calcul IA
-            setTimeout(() => {
-                loader.style.display = "none";
-                generateBtn.disabled = false;
+        document.getElementById("progressBar").style.width = proj.progress + "%";
+        document.getElementById("progressPercent").innerText = proj.progress + "%";
+        document.getElementById("progressText").innerText = proj.statusMessage;
+        document.getElementById("statusBadge").innerText = proj.status;
 
-                const basePool = fragments[genre];
-                const selectedFragment = basePool[Math.floor(Math.random() * basePool.length)];
-                const subject = seed ? `Inspiré par : "${seed}". ` : "";
-                
-                const fullText = `${subject}${selectedFragment} Ce n'était que le préambule d'un bouleversement qui allait redéfinir l'équilibre du monde connu. Les observateurs silencieux consignaient déjà chaque détail, conscients que l'Histoire ne ferait aucun compromis.`;
+        if (proj.status === "READY") {
+          sse.close();
+          document.getElementById("generateBtn").disabled = false;
+          preloadAssets();
+        }
+      };
+    }
 
-                storyTitle.textContent = `Chronique de l'Instant : ${genreSelect.options[genreSelect.selectedIndex].text}`;
-                storyTitle.style.display = "block";
+    function preloadAssets() {
+      currentProject.scenes.forEach(s => {
+        const img = new Image();
+        img.src = s.imageUrl;
+        loadedImages[s.id] = img;
+      });
+      initPlayback();
+    }
 
-                // Effet d'écriture en direct (Typewriter)
-                typeWriterEffect(fullText, storyContent);
-            }, 900);
+    function initPlayback() {
+      currentSceneIdx = 0;
+      loadScene(0);
+      requestAnimationFrame(renderLoop);
+    }
+
+    function loadScene(idx) {
+      if (idx >= currentProject.scenes.length) {
+        isPlaying = false;
+        document.getElementById("playBtn").innerText = "Lecture";
+        return;
+      }
+      currentSceneIdx = idx;
+      const scene = currentProject.scenes[idx];
+      audioElem.src = "data:audio/mp3;base64," + scene.audioBase64;
+      if (isPlaying) audioElem.play();
+      sceneStartTime = performance.now();
+
+      audioElem.onended = () => {
+        loadScene(currentSceneIdx + 1);
+      };
+    }
+
+    function togglePlay() {
+      if (!currentProject || currentProject.scenes.length === 0) return;
+      isPlaying = !isPlaying;
+      document.getElementById("playBtn").innerText = isPlaying ? "Pause" : "Lecture";
+      if (isPlaying) {
+        audioElem.play();
+      } else {
+        audioElem.pause();
+      }
+    }
+
+    function renderLoop(now) {
+      if (currentProject && currentProject.scenes.length > 0) {
+        const scene = currentProject.scenes[currentSceneIdx];
+        const img = loadedImages[scene.id];
+
+        // Effet Ken Burns (Zoom lent)
+        if (img && img.complete) {
+          const progress = Math.min(1, (audioElem.currentTime || 0) / scene.durationInSec);
+          const scale = 1 + progress * 0.1;
+          ctx.save();
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.translate(canvas.width / 2, canvas.height / 2);
+          ctx.scale(scale, scale);
+          ctx.drawImage(img, -canvas.width / 2, -canvas.height / 2, canvas.width, canvas.height);
+          ctx.restore();
+        }
+
+        // Synchronisation des sous-titres karaoké
+        const curTime = audioElem.currentTime || 0;
+        const overlay = document.getElementById("subtitlesOverlay");
+        overlay.innerHTML = "";
+
+        scene.alignmentData.forEach(w => {
+          const span = document.createElement("span");
+          span.innerText = w.word;
+          const isActive = curTime >= w.start && curTime <= w.end;
+          span.className = "text-2xl font-black uppercase px-2 py-1 rounded " + 
+            (isActive ? "bg-amber-400 text-black scale-110" : "text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.9)] opacity-75");
+          overlay.appendChild(span);
         });
 
-        function typeWriterEffect(text, element) {
-            element.textContent = "";
-            let i = 0;
-            const speed = 18;
-
-            function type() {
-                if (i < text.length) {
-                    element.textContent += text.charAt(i);
-                    i++;
-                    setTimeout(type, speed);
-                }
-            }
-            type();
-        }
-    </script>
+        document.getElementById("timeTracker").innerText = 
+          curTime.toFixed(1) + "s / " + scene.durationInSec.toFixed(1) + "s";
+      }
+      requestAnimationFrame(renderLoop);
+    }
+  </script>
 </body>
-</html>
+</html>`;
+
+// ============================================================================
+// 4. SERVEUR HTTP REST + ROUTEUR SSE
+// ============================================================================
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = new URL(req.url || "/", `http://${req.headers.host}`);
+  const pathname = parsedUrl.pathname;
+
+  // Servir l'interface web
+  if (req.method === "GET" && pathname === "/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    return res.end(FRONTEND_HTML);
+  }
+
+  // API : Créer un projet
+  if (req.method === "POST" && pathname === "/api/projects") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", async () => {
+      const { story, genre, visualStyle } = JSON.parse(body);
+      const projectId = "proj_" + Date.now();
+
+      const newProject: Project = {
+        id: projectId,
+        title: "Nouvelle Histoire",
+        rawStory: story,
+        genre,
+        visualStyle,
+        status: "PENDING",
+        progress: 0,
+        statusMessage: "En attente...",
+        scenes: [],
+      };
+
+      db.set(projectId, newProject);
+      runPipeline(projectId); // Traitement asynchrone non-bloquant
+
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ projectId }));
+    });
+    return;
+  }
+
+  // API : Server-Sent Events pour la progression temps réel
+  if (req.method === "GET" && pathname.startsWith("/api/sse/")) {
+    const projectId = pathname.split("/").pop()!;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    if (!sseClients.has(projectId)) sseClients.set(projectId, []);
+    sseClients.get(projectId)!.push(res);
+
+    if (db.has(projectId)) {
+      res.write(`data: ${JSON.stringify(db.get(projectId))}\n\n`);
+    }
+
+    req.on("close", () => {
+      const clients = sseClients.get(projectId) || [];
+      sseClients.set(projectId, clients.filter((c) => c !== res));
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("Not Found");
+});
+
+// ============================================================================
+// 5. DÉMARRAGE
+// ============================================================================
+server.listen(CONFIG.PORT, () => {
+  console.log(`Serveur prêt sur http://localhost:${CONFIG.PORT}`);
+});
+
