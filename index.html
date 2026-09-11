@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MythosAI - Forge de Récits Génératifs</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=Inter:wght@300;400;500;600&family=Merriweather:ital,wght@0,300;0,400;1,300&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --gold-gradient: linear-gradient(135deg, #d4af37 0%, #f3e5ab 50%, #aa771c 100%);
+            --gold-border: #d4af37;
+            --side-white: #ffffff;
+            --bg-dark: #0d0f12;
+            --surface-dark: #161a22;
+            --text-main: #e6edf3;
+            --text-muted: #8b949e;
+            --accent: #e2b714;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            border-left: 14px solid var(--side-white);
+            border-right: 14px solid var(--side-white);
+        }
+
+        /* En-tête Doré avec bordures latérales */
+        header {
+            background: var(--gold-gradient);
+            color: #121212;
+            padding: 2.5rem 2rem;
+            text-align: center;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.4);
+            box-shadow: 0 10px 30px rgba(212, 175, 55, 0.25);
+        }
+
+        header h1 {
+            font-family: 'Cinzel', serif;
+            font-size: 2.8rem;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+
+        header p {
+            font-size: 1.05rem;
+            font-weight: 500;
+            letter-spacing: 1px;
+            opacity: 0.9;
+        }
+
+        /* Conteneur Principal */
+        main {
+            flex: 1;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 3rem 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 2.5rem;
+        }
+
+        /* Panneau de configuration */
+        .prompt-panel {
+            background: var(--surface-dark);
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        }
+
+        .controls-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        select, input[type="text"] {
+            width: 100%;
+            background: #090d13;
+            border: 1px solid #30363d;
+            color: var(--text-main);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        select:focus, input[type="text"]:focus {
+            border-color: var(--accent);
+        }
+
+        .action-area {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 1rem;
+        }
+
+        button.btn-generate {
+            background: var(--gold-gradient);
+            color: #000;
+            font-weight: 600;
+            border: none;
+            padding: 0.9rem 2rem;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            letter-spacing: 0.5px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        button.btn-generate:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(212, 175, 55, 0.4);
+        }
+
+        button.btn-generate:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Affichage du Récit */
+        .story-display {
+            background: var(--surface-dark);
+            border: 1px solid #30363d;
+            border-radius: 12px;
+            padding: 2.5rem;
+            min-height: 250px;
+            position: relative;
+        }
+
+        .story-title {
+            font-family: 'Cinzel', serif;
+            font-size: 1.6rem;
+            color: var(--accent);
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 0.5rem;
+            display: none;
+        }
+
+        .story-body {
+            font-family: 'Merriweather', serif;
+            font-size: 1.1rem;
+            line-height: 1.8;
+            color: #c9d1d9;
+            white-space: pre-line;
+        }
+
+        .placeholder-text {
+            color: var(--text-muted);
+            font-style: italic;
+            text-align: center;
+            margin-top: 3rem;
+        }
+
+        /* Indicateur de chargement */
+        .pulse-loader {
+            display: none;
+            width: 12px;
+            height: 12px;
+            background: var(--accent);
+            border-radius: 50%;
+            margin: 2rem auto;
+            animation: pulse 1s infinite alternate;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 0.4; }
+            100% { transform: scale(2); opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>Mythos AI</h1>
+        <p>Générateur Narratif Propulsé par Intelligence Artificielle</p>
+    </header>
+
+    <main>
+        <section class="prompt-panel">
+            <div class="controls-grid">
+                <div>
+                    <label for="genre">Genre littéraire</label>
+                    <select id="genre">
+                        <option value="cyberpunk">Cyberpunk / Dystopie</option>
+                        <option value="fantasy">Dark Fantasy</option>
+                        <option value="scifi">Odyssée Spatiale</option>
+                        <option value="historical">Fresque Historique</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="tone">Tonalité</label>
+                    <select id="tone">
+                        <option value="mystique">Énigmatique & Sombre</option>
+                        <option value="heroique">Épique & Triomphant</option>
+                        <option value="poetique">Mélancolique & Poétique</option>
+                    </select>
+                </div>
+            </div>
+
+            <div>
+                <label for="seed">Élément déclencheur (Seed)</label>
+                <input type="text" id="seed" placeholder="Ex: Une montre mécanique découverte sur Mars..." />
+            </div>
+
+            <div class="action-area">
+                <button id="generateBtn" class="btn-generate">
+                    <span>Générer l'histoire</span>
+                </button>
+            </div>
+        </section>
+
+        <section class="story-display">
+            <div id="loader" class="pulse-loader"></div>
+            <h2 id="storyTitle" class="story-title"></h2>
+            <div id="storyContent" class="story-body">
+                <p class="placeholder-text">Configurez les paramètres ci-dessus pour éveiller le moteur narratif.</p>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        // Banques narratives simulées pour démonstration hackathon (remplaçable par un fetch API LLM)
+        const fragments = {
+            cyberpunk: [
+                "Sous la pluie d'acide de Neo-Kyoto, les néons clignotaient comme des artères mourantes.",
+                "L'androïde baissa les yeux vers le composant organique qu'il tenait dans sa paume métallique.",
+                "Dans les méandres du cyberespace, une conscience oubliée venait d'émettre son premier battement."
+            ],
+            fantasy: [
+                "Le vent glacial des montagnes de fer hurlait la chute imminente des rois anciens.",
+                "Les runes gravées sur la roche millénaire se mirent à pulser d'une lueur azurée.",
+                "Aucun homme n'était censé survivre au passage de la forêt d'ébène, pourtant il marchait encore."
+            ],
+            scifi: [
+                "À la périphérie d'Orion, le silence stellaire fut déchiré par un signal à fréquence inconnue.",
+                "Les instruments du vaisseau indiquaient une anomalie gravitationnelle défiant toute logique cartésienne.",
+                "Isolée à trois cents années-lumière de la Terre, la balise venait de s'allumer pour la première fois en un siècle."
+            ],
+            historical: [
+                "À l'aube du siège, les cloches de la citadelle sonnèrent avec une lourdeur funèbre.",
+                "Le parchemin scellé de pourpre contenait l'ordre qui allait redessiner les frontières de l'Empire.",
+                "Les pas lourds de la garde résonnaient contre les dalles froides de la cathédrale déserte."
+            ]
+        };
+
+        const generateBtn = document.getElementById('generateBtn');
+        const storyTitle = document.getElementById('storyTitle');
+        const storyContent = document.getElementById('storyContent');
+        const loader = document.getElementById('loader');
+        const seedInput = document.getElementById('seed');
+        const genreSelect = document.getElementById('genre');
+
+        generateBtn.addEventListener('click', () => {
+            const genre = genreSelect.value;
+            const seed = seedInput.value.trim();
+
+            // Gestion de l'état UI
+            generateBtn.disabled = true;
+            storyContent.innerHTML = "";
+            storyTitle.style.display = "none";
+            loader.style.display = "block";
+
+            // Simulation du temps de calcul IA
+            setTimeout(() => {
+                loader.style.display = "none";
+                generateBtn.disabled = false;
+
+                const basePool = fragments[genre];
+                const selectedFragment = basePool[Math.floor(Math.random() * basePool.length)];
+                const subject = seed ? `Inspiré par : "${seed}". ` : "";
+                
+                const fullText = `${subject}${selectedFragment} Ce n'était que le préambule d'un bouleversement qui allait redéfinir l'équilibre du monde connu. Les observateurs silencieux consignaient déjà chaque détail, conscients que l'Histoire ne ferait aucun compromis.`;
+
+                storyTitle.textContent = `Chronique de l'Instant : ${genreSelect.options[genreSelect.selectedIndex].text}`;
+                storyTitle.style.display = "block";
+
+                // Effet d'écriture en direct (Typewriter)
+                typeWriterEffect(fullText, storyContent);
+            }, 900);
+        });
+
+        function typeWriterEffect(text, element) {
+            element.textContent = "";
+            let i = 0;
+            const speed = 18;
+
+            function type() {
+                if (i < text.length) {
+                    element.textContent += text.charAt(i);
+                    i++;
+                    setTimeout(type, speed);
+                }
+            }
+            type();
+        }
+    </script>
+</body>
+</html>
